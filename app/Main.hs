@@ -1,161 +1,287 @@
-{-# LANGUAGE ImportQualifiedPost #-}
-
 {-# LANGUAGE OverloadedStrings #-}
 
-module Main (main) where
+{-# OPTIONS_GHC -Wno-unused-do-bind #-}
+
+{-# LANGUAGE BlockArguments #-}
+
+{-# LANGUAGE OverloadedRecordDot #-}
+
+module Main (main, createBody) where
 
 import Control.Monad (forever)
 
-import Data.Bifunctor (Bifunctor (second), first)
+import qualified Data.ByteString.Char8 as BC
 
-import Data.ByteString qualified as BS
+import Network.Socket as NetSock
 
-import Data.ByteString.Char8 qualified as BC
+    ( getAddrInfo,
 
-import Data.ByteString.Internal qualified as BS
+      accept,
 
-import Network.Socket
+      bind,
 
-import Network.Socket.ByteString (recv, sendAll)
+      listen,
 
-import System.IO (BufferMode (..), hSetBuffering, stdout)
+      socket,
+
+      close,
+
+      defaultProtocol,
+
+      AddrInfo(addrAddress, addrFamily),
+
+    --   SocketType(Stream), setSocketOption, SocketOption (ReuseAddr) )
+
+      SocketType(Stream), setSocketOption, SocketOption (ReuseAddr), Socket )
+
+import Network.Socket.ByteString as NBS (send, recv)
+
+-- import System.IO (BufferMode (..), hSetBuffering, stdout)
+
+import System.IO (BufferMode (..), hSetBuffering, stdout, openFile, IOMode (ReadMode), hGetContents)
+
+import qualified System.IO as SIO
+
+import Data.Function ((&))
+
+import Data.Maybe (isJust)
+
+import Control.Concurrent (threadDelay, forkIO)
+
+import qualified Data.List as List
+
+-- import Control.Exception (catch, AsyncException (UserInterrupt))
+
+import Control.Exception (catch, AsyncException (UserInterrupt), SomeException (SomeException))
+
+import System.Environment as SE (getArgs)
+
+createBody :: [[Char]] -> [Char]
+
+createBody payload =
+
+    let body = (BC.unpack . BC.dropEnd 1 .  BC.pack . concat $ zipWith (++) payload (repeat "/")) in
+
+        ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " ++ show (length body) ++ "\r\n\r\n" ++ body)
+
+createResponse :: HttpMsg -> [(BC.ByteString, BC.ByteString)] -> BC.ByteString -> [Char]
+
+createResponse request headers body =
+
+    ("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " ++ show (BC.length body) ++ "\r\n\r\n" ++ BC.unpack body)
+
+data HttpMsg = HttpMsg {
+
+    method :: BC.ByteString
+
+    , path :: BC.ByteString
+
+    , protocol :: [BC.ByteString]
+
+    , headers :: [(BC.ByteString, BC.ByteString)]} deriving (Show)
+
+destructHeader :: [BC.ByteString] -> Maybe (BC.ByteString, BC.ByteString)
+
+destructHeader [n, v] = Just (BC.dropEnd 1 n, v)
+
+destructHeader _ = Nothing
+
+parseHeaders :: [BC.ByteString] -> [(BC.ByteString, BC.ByteString)]
+
+parseHeaders = foldr ((\header acc ->
+
+                case header of
+
+                    Just kv -> kv:acc
+
+                    Nothing -> acc
+
+        ) . destructHeader . BC.words) []
+
+parseMsg :: BC.ByteString -> HttpMsg
+
+parseMsg msg =
+
+    let first:headers = map (BC.dropEnd 1) $ BC.lines msg in
+
+        let method:path:protocol = BC.split ' ' first in
+
+            HttpMsg {method = method, path = path, protocol = protocol, headers = parseHeaders headers}
+
+test :: BC.ByteString
+
+test = BC.pack "GET /user-agent HTTP/1.1\r\n\
+
+\Host: localhost:4221\r\n\ 
+
+\User-Agent: curl/7.64.1\r\n\r\n"
+
+handleUserAgent request =
+
+    -- case List.find (\(k,_) -> k == BC.pack ("User-Agent")) (headers request) of
+
+    case List.find (\(k,_) -> k == BC.pack "User-Agent") (headers request) of
+
+        Just(_, v) -> createResponse request [] v
+
+        Nothing -> createResponse request [] BC.empty
+
+getDirectoryFromArgs :: [[Char]] -> Maybe [Char]
+
+getDirectoryFromArgs ["--directory", dir] = Just dir
+
+getDirectoryFromArgs _ = Nothing
+
+handleGetFile :: Socket -> HttpMsg -> Maybe [Char] -> [Char] ->  IO Int
+
+handleGetFile sock msg (Just dir) file = do
+
+    let filePath = dir <> "/" <> file
+
+    putStrLn $ "Going to open file " <> filePath
+
+    catch (do
+
+        handle <- openFile filePath ReadMode
+
+        contents <- hGetContents handle
+
+        send sock $ BC.pack ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " ++ show (length contents) ++ "\r\n\r\n" ++ contents))
+
+        (\(SomeException _) -> 
+
+            send sock "HTTP/1.1 404 Not Found\r\n\r\n")
+
+handleGetFile sock _ Nothing _ = do
+
+    send sock "HTTP/1.1 404 Not Found\r\n\r\n"
 
 main :: IO ()
 
 main = do
 
-  hSetBuffering stdout LineBuffering
+    hSetBuffering stdout LineBuffering
 
-  let host = "127.0.0.1"
+    -- You can use print statements as follows for debugging, they'll be visible when running tests.
 
-      port = "4221"
+    BC.putStrLn "Logs from your program will appear here"
 
-  BC.putStrLn $ "Listening on " <> BC.pack host <> ":" <> BC.pack port
+    -- Uncomment this block to pass first stage
 
-  addrInfo <- getAddrInfo Nothing (Just host) (Just port)
+    let host = "127.0.0.1"
 
-  serverSocket <- socket (addrFamily $ head addrInfo) Stream defaultProtocol
+        port = "4221"
 
-  setSocketOption serverSocket ReuseAddr 1
+    --
 
-  setSocketOption serverSocket ReusePort 1
+    BC.putStrLn $ "Listening on " <> BC.pack host <> ":" <> BC.pack port
 
-  bind serverSocket $ addrAddress $ head addrInfo
+    --
 
-  listen serverSocket 5
+    -- Get address information for the given host and port
 
-  forever $ do
+    addrInfo <- getAddrInfo Nothing (Just host) (Just port)
 
-    (clientSocket, clientAddr) <- accept serverSocket
+    --
 
-    BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr) <> "."
+    serverSocket <- socket (addrFamily $ head addrInfo) Stream defaultProtocol
 
-    -- let nextLine old = do
+    setSocketOption serverSocket ReuseAddr 1
 
-    --       new <- recv clientSocket 256
+    bind serverSocket $ addrAddress $ head addrInfo
 
-    --       let full = old <> new
+    listen serverSocket 2
 
-    --       let (line, rest) = BS.breakSubstring "\r\n" full
+    args <- getArgs
 
-    --       if BS.length line + 2 <= BS.length full
+    BC.putStrLn $ "Args" <> BC.pack (show args)
 
-    --         then return (line, BS.drop 2 rest)
+    let directory = getDirectoryFromArgs args
 
-    --         else nextLine full
+    catch
 
-    -- (line, rest) <- nextLine ""
+        (
 
-    -- let [_, path, _] = BS.split (BS.c2w ' ') line
+        -- Accept connections and handle them forever
 
-    -- let splitPath = BS.split (BS.c2w '/') path
+        forever $ do
 
-    -- sendAll clientSocket =<< case (path, splitPath) of
+            (clientSocket, clientAddr) <- accept serverSocket
 
-    init <- recv clientSocket 4096
+            forkIO $ do
 
-    let parseLines bs = do
+                BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr) <> "."
 
-          if "\r\n" `BS.isPrefixOf` bs
+                -- Handle the clientSocket as needed...
 
-            then do
+                -- buff <- recv clientSocket 91
 
-              return ([], BS.drop 2 bs)
+                buff <- recv clientSocket 1024
 
-            else do
+                BC.putStrLn $ "Received " <> BC.pack (show buff)
 
-              let (line, rest) = BS.breakSubstring "\r\n" bs
+                let msg = parseMsg buff
 
-              if BS.length line + 2 <= BS.length bs
+                -- let resp = case map BC.unpack . BC.split '/' $ msg.path of
 
-                then do
+                --             ("":"":_) -> "HTTP/1.1 200 OK\r\n\r\n"
 
-                  first (line :) <$> parseLines (BS.drop 2 rest)
+                --             ("":"echo":payload) -> createBody payload
 
-                else do
+                --             ("":"user-agent":_) -> handleUserAgent msg
 
-                  extra <- recv clientSocket 4096
+                --             _ -> "HTTP/1.1 404 NOT FOUND\r\n\r\n"
 
-                  parseLines $ bs <> extra
+                -- let resp = case map BC.unpack . BC.split '/' $ msg.path of
 
-    (startLine : rawHeaders, bodyStart) <- parseLines init
+                --             ("":"":_) -> "HTTP/1.1 200 OK\r\n\r\n"
 
-    let [_, path, _] = BS.split (BS.c2w ' ') startLine
+                --             ("":"echo":payload) -> createBody payload
 
-    let pathParts = BS.split (BS.c2w '/') path
+                --             ("":"user-agent":_) -> handleUserAgent msg
 
-    let headers = map (second (BS.drop 2) . BS.breakSubstring ": ") rawHeaders
+                --             ("":"files":filename) -> handleGetFile msg directory filename
 
-    sendAll clientSocket =<< case (path, pathParts) of
+                --             _ -> "HTTP/1.1 404 NOT FOUND\r\n\r\n"
 
-      ("/", _) -> do
+                case map BC.unpack . BC.split '/' $ msg.path of
 
-        return "HTTP/1.1 200 OK\r\n\r\n"
+                            ("":"":_) -> send clientSocket "HTTP/1.1 200 OK\r\n\r\n"
 
-      (_, ["", "echo", s]) -> do
+                            ("":"echo":payload) -> send clientSocket $ BC.pack $ createBody payload
 
-        return
+                            ("":"user-agent":_) -> send clientSocket $ BC.pack $ handleUserAgent msg
 
-          $ mconcat
+                            ("":"files":filename:_) -> handleGetFile clientSocket msg directory filename
 
-            [ "HTTP/1.1 200 OK"
+                            _ -> send clientSocket "HTTP/1.1 404 Not Found\r\n\r\n"
 
-            , "\r\n"
+                    -- if path == "/" then
 
-            , "Content-Type: text/plain\r\n"
+                    --      "HTTP/1.1 200 OK\r\n\r\n"
 
-            , "Content-Length: " <> (BS.packChars . show $ BS.length s) <> "\r\n"
+                    --     else  "HTTP/1.1 404 NOT FOUND\r\n\r\n"
 
-            , "\r\n"
+                -- BC.putStrLn $ "Resp is " <> BC.pack (show resp)
 
-            , s
+                -- _ <- send clientSocket (BC.pack resp)
 
-            ]
+                -- BC.putStrLn $ "Resp is " <> BC.pack (show resp)
 
-      (_, ["", "user-agent"]) -> do
+                -- _ <- send clientSocket (BC.pack resp)
 
-        let Just s = lookup "User-Agent" headers
+                close clientSocket
 
-        return
+        )
 
-          $ mconcat
+        (   \UserInterrupt ->
 
-            [ "HTTP/1.1 200 OK"
+            -- do 
 
-            , "\r\n"
+            do
 
-            , "Content-Type: text/plain\r\n"
+                close serverSocket
 
-            , "Content-Length: " <> (BS.packChars . show $ BS.length s) <> "\r\n"
+                BC.putStrLn "Interrupt exception - closing server"
 
-            , "\r\n"
-
-            , s
-
-            ]
-
-      _ -> do
-
-        return "HTTP/1.1 404 Not Found\r\n\r\n"
-
-    close clientSocket
+        )
