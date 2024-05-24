@@ -1,143 +1,161 @@
+{-# LANGUAGE ImportQualifiedPost #-}
+
 {-# LANGUAGE OverloadedStrings #-}
 
 module Main (main) where
 
-import           Control.Monad             (forever)
+import Control.Monad (forever)
 
-import qualified Data.ByteString.Char8     as BC
+import Data.Bifunctor (Bifunctor (second), first)
 
-import           Data.Either               (fromRight)
+import Data.ByteString qualified as BS
 
-import           Data.Maybe                (fromJust)
+import Data.ByteString.Char8 qualified as BC
 
-import           Network.Socket
+import Data.ByteString.Internal qualified as BS
 
-import           Network.Socket.ByteString (recv, sendAll)
+import Network.Socket
 
-import           System.IO                 (BufferMode (..), hSetBuffering,
+import Network.Socket.ByteString (recv, sendAll)
 
-                                            stdout)
-
-data Method = GET
-
-            | POST
-
-            deriving (Show, Read, Eq)
-
-data Header = Header BC.ByteString BC.ByteString
-
-    deriving (Show, Eq, Read)
-
-data HttpRequest = HttpRequest { method  :: Method
-
-                               , path    :: BC.ByteString
-
-                               , headers :: [Header]
-
-                               } deriving (Show, Read)
-
-breakLines :: BC.ByteString -> [BC.ByteString]
-
-breakLines bs = let (l, rs) = BC.breakSubstring "\r\n" bs
-
-                    rest = BC.drop 2 rs
-
-                 in l : if BC.null rest then [] else breakLines rest
-
-parseMethod :: BC.ByteString -> Either String Method
-
-parseMethod "GET"  = Right GET
-
-parseMethod "POST" = Right POST
-
-parseMethod other  = Left $ "Unknown method: " <> BC.unpack other
-
-parseReq :: BC.ByteString -> Either String HttpRequest
-
-parseReq rawReq = let lines = breakLines rawReq
-
-                      first = head lines
-
-                      (m : p : _) = BC.split ' ' first
-
-                   in ((\method -> HttpRequest method p []) <$> parseMethod m)
-
-handleReq :: Socket -> HttpRequest -> IO () -- TODO reader?
-
-handleReq socket (HttpRequest GET path _) =
-
-    case path of
-
-    --   "/" -> sendAll socket resp200
-
-    --   _   -> sendAll socket resp404
-
-      "/"                            -> sendAll socket resp200
-
-      p | "/echo/" `BC.isPrefixOf` p -> sendAll socket (echoResponse p)
-
-      _                              -> sendAll socket resp404
-
-  where
-
-    resp404 = "HTTP/1.1 404 Not Found\r\n\r\n"
-
-    resp200 = "HTTP/1.1 200 OK\r\n\r\n"
-
-    echoResponse :: BC.ByteString -> BC.ByteString
-
-    echoResponse echoPath = let body = fromJust $ BC.stripPrefix "/echo/" echoPath
-
-                                contentLen = BC.length body
-
-                                respLines  = ["HTTP/1.1 200 OK", "Content-Type: text/plain", "Content-Length: " <> BC.pack (show contentLen)] :: [BC.ByteString]
-
-                             in BC.intercalate "\r\n" respLines <> "\r\n\r\n" <> body
+import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 main :: IO ()
 
 main = do
 
-    hSetBuffering stdout LineBuffering
+  hSetBuffering stdout LineBuffering
 
-    -- Uncomment this block to pass first stage
+  let host = "127.0.0.1"
 
-    let host = "127.0.0.1"
+      port = "4221"
 
-        port = "4221"
+  BC.putStrLn $ "Listening on " <> BC.pack host <> ":" <> BC.pack port
 
-    BC.putStrLn $ "Listening on " <> BC.pack host <> ":" <> BC.pack port
+  addrInfo <- getAddrInfo Nothing (Just host) (Just port)
 
-    -- Get address information for the given host and port
+  serverSocket <- socket (addrFamily $ head addrInfo) Stream defaultProtocol
 
-    addrInfo <- getAddrInfo Nothing (Just host) (Just port)
+  setSocketOption serverSocket ReuseAddr 1
 
-    serverSocket <- socket (addrFamily $ head addrInfo) Stream defaultProtocol
+  setSocketOption serverSocket ReusePort 1
 
-    setSocketOption serverSocket ReuseAddr 1
+  bind serverSocket $ addrAddress $ head addrInfo
 
-    bind serverSocket $ addrAddress $ head addrInfo
+  listen serverSocket 5
 
-    listen serverSocket 5
+  forever $ do
 
-    -- Accept connections and handle them forever
+    (clientSocket, clientAddr) <- accept serverSocket
 
-    forever $ do
+    BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr) <> "."
 
-        (clientSocket, clientAddr) <- accept serverSocket
+    -- let nextLine old = do
 
-        BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr) <> "."
+    --       new <- recv clientSocket 256
 
-        -- Handle the clientSocket as needed...
+    --       let full = old <> new
 
-        rawReq <- recv clientSocket 4096
+    --       let (line, rest) = BS.breakSubstring "\r\n" full
 
-        let req = parseReq rawReq
+    --       if BS.length line + 2 <= BS.length full
 
-        case req of
+    --         then return (line, BS.drop 2 rest)
 
-          Right r  -> handleReq clientSocket r
+    --         else nextLine full
 
-          Left err -> fail err
+    -- (line, rest) <- nextLine ""
 
-        close clientSocket
+    -- let [_, path, _] = BS.split (BS.c2w ' ') line
+
+    -- let splitPath = BS.split (BS.c2w '/') path
+
+    -- sendAll clientSocket =<< case (path, splitPath) of
+
+    init <- recv clientSocket 4096
+
+    let parseLines bs = do
+
+          if "\r\n" `BS.isPrefixOf` bs
+
+            then do
+
+              return ([], BS.drop 2 bs)
+
+            else do
+
+              let (line, rest) = BS.breakSubstring "\r\n" bs
+
+              if BS.length line + 2 <= BS.length bs
+
+                then do
+
+                  first (line :) <$> parseLines (BS.drop 2 rest)
+
+                else do
+
+                  extra <- recv clientSocket 4096
+
+                  parseLines $ bs <> extra
+
+    (startLine : rawHeaders, bodyStart) <- parseLines init
+
+    let [_, path, _] = BS.split (BS.c2w ' ') startLine
+
+    let pathParts = BS.split (BS.c2w '/') path
+
+    let headers = map (second (BS.drop 2) . BS.breakSubstring ": ") rawHeaders
+
+    sendAll clientSocket =<< case (path, pathParts) of
+
+      ("/", _) -> do
+
+        return "HTTP/1.1 200 OK\r\n\r\n"
+
+      (_, ["", "echo", s]) -> do
+
+        return
+
+          $ mconcat
+
+            [ "HTTP/1.1 200 OK"
+
+            , "\r\n"
+
+            , "Content-Type: text/plain\r\n"
+
+            , "Content-Length: " <> (BS.packChars . show $ BS.length s) <> "\r\n"
+
+            , "\r\n"
+
+            , s
+
+            ]
+
+      (_, ["", "user-agent"]) -> do
+
+        let Just s = lookup "User-Agent" headers
+
+        return
+
+          $ mconcat
+
+            [ "HTTP/1.1 200 OK"
+
+            , "\r\n"
+
+            , "Content-Type: text/plain\r\n"
+
+            , "Content-Length: " <> (BS.packChars . show $ BS.length s) <> "\r\n"
+
+            , "\r\n"
+
+            , s
+
+            ]
+
+      _ -> do
+
+        return "HTTP/1.1 404 Not Found\r\n\r\n"
+
+    close clientSocket
