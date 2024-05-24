@@ -6,6 +6,7 @@ import Control.Monad (forever)
 import qualified Data.ByteString.Char8 as BC
 import Network.Socket
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import Network.Socket.ByteString (send, recv)
 
 main :: IO ()
 main = do
@@ -30,7 +31,9 @@ main = do
     -- Accept connections and handle them forever
     forever $ do
         (clientSocket, clientAddr) <- accept serverSocket
-        BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr) <> "."
+        -- BC.putStrLn $ "Accepted connection from " <> BC.pack (show clientAddr) <> "."
         -- Handle the clientSocket as needed...
-    
+        -- myData <-recv clientSocket 4096
+        -- BC.putStrLn $ "Received: " <> myData
+        send clientSocket $ "HTTP/1.1 200 OK" <> "\r\n" <> "\r\n"
         close clientSocket
